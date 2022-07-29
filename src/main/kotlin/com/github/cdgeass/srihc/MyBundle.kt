@@ -1,4 +1,4 @@
-package com.github.cdgeass.springrequestsinhttpclient
+package com.github.cdgeass.srihc
 
 import com.intellij.DynamicBundle
 import org.jetbrains.annotations.NonNls
