@@ -4,18 +4,16 @@ import com.intellij.httpClient.http.request.HttpRequestFileType
 import com.intellij.httpClient.http.request.HttpRequestVariableSubstitutor
 import com.intellij.httpClient.http.request.psi.HttpRequestBlock
 import com.intellij.httpClient.http.request.psi.HttpRequestMessagesGroup
-import com.intellij.httpClient.http.request.psi.codeStyle.HttpRequestGroupBlock
 import com.intellij.microservices.url.UrlPath
 import com.intellij.microservices.url.UrlResolveRequest
 import com.intellij.microservices.url.UrlResolverManager
-import com.intellij.microservices.url.references.UrlPathReference
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
+import com.intellij.openapi.command.CommandProcessor
 import com.intellij.psi.PsiMethod
+import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiWhiteSpace
-import com.intellij.psi.search.searches.ReferenceSearcher
-import com.intellij.psi.search.searches.ReferencesSearch
 import com.intellij.psi.util.PsiUtilCore
 
 class GenerateSpringRequestsAction : AnAction() {
@@ -41,7 +39,7 @@ class GenerateSpringRequestsAction : AnAction() {
 
         /*
         当前位置为空白, 前一个元素为请求体, 且后一个元素不为消息体时生成
-         */
+        */
         val element = PsiUtilCore.getElementAtOffset(psiFile, editor.caretModel.offset)
         return element is PsiWhiteSpace && element.prevSibling is HttpRequestBlock && element.nextSibling !is HttpRequestMessagesGroup
     }
@@ -49,6 +47,10 @@ class GenerateSpringRequestsAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
         val requestBlock = getHttpRequestBlock(event) ?: return
         val method = searchEndpoint(requestBlock) ?: return
+
+        val param = getRequestParam(method) ?: return
+        insertRequestMessage(event, param)
+
         return
     }
 
@@ -90,6 +92,43 @@ class GenerateSpringRequestsAction : AnAction() {
             return null
         }
         return psiMethod
+    }
+
+    /**
+     * 获取接口方法的参数
+     * - 标注了 @RequestBody 的参数
+     */
+    private fun getRequestParam(method: PsiMethod): PsiParameter? {
+        return method.parameterList.parameters.filter { !isInternalParam(it) }.firstOrNull { it ->
+                it.annotations.any { it.hasQualifiedName("org.springframework.web.bind.annotation.RequestBody") }
+            }
+    }
+
+    /**
+     * 判断参数是否是 spring 的内置参数
+     */
+    private fun isInternalParam(param: PsiParameter): Boolean {
+        return false
+    }
+
+    /**
+     * 生成 .http 文件中插入请求体
+     */
+    private fun insertRequestMessage(event: AnActionEvent, param: PsiParameter) {
+        val editor = event.getData(CommonDataKeys.EDITOR) ?: return
+        val document = editor.document
+        if (!document.isWritable) {
+            return
+        }
+        document.fireReadOnlyModificationAttempt()
+        val offset = editor.caretModel.offset
+
+        val process = Runnable {
+            document.insertString(offset, "{}")
+        }
+        // 通过 CommandProcessor 执行修改可撤销
+        val processor = CommandProcessor.getInstance()
+        processor.executeCommand(event.project, process, "io.github.cdgeass.GenerateSpringRequests", document)
     }
 
 }
