@@ -1,8 +1,10 @@
 package com.github.cdgeass.srihc.actions
 
-import com.github.cdgeass.srihc.actions.AnnotationType.*
+import com.github.cdgeass.srihc.actions.AnnotationType.RequestBody
+import com.github.cdgeass.srihc.actions.AnnotationType.RequestParam
 import com.intellij.httpClient.http.request.HttpRequestFileType
 import com.intellij.httpClient.http.request.HttpRequestHeaderFields
+import com.intellij.httpClient.http.request.HttpRequestPsiFile
 import com.intellij.httpClient.http.request.HttpRequestVariableSubstitutor
 import com.intellij.httpClient.http.request.psi.HttpRequest
 import com.intellij.httpClient.http.request.psi.HttpRequestBlock
@@ -15,17 +17,14 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.command.CommandProcessor
-import com.intellij.openapi.editor.Document
 import com.intellij.psi.PsiClassType
 import com.intellij.psi.PsiMethod
 import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.util.PsiUtilCore
-import com.intellij.refactoring.suggested.endOffset
 
 enum class AnnotationType(val qualifiedName: String) {
-    RequestParam("org.springframework.web.bind.annotation.RequestParam"),
-    RequestBody("org.springframework.web.bind.annotation.RequestBody");
+    RequestParam("org.springframework.web.bind.annotation.RequestParam"), RequestBody("org.springframework.web.bind.annotation.RequestBody");
 
     companion object {
         fun valueOf(qualifiedName: String?): AnnotationType? {
@@ -65,6 +64,7 @@ class GenerateSpringRequestsAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
         // 获取 document
         val editor = event.getData(CommonDataKeys.EDITOR) ?: return
+        val psiFile = event.getData(CommonDataKeys.PSI_FILE) ?: return
         val document = editor.document
         if (!document.isWritable) {
             return
@@ -80,8 +80,7 @@ class GenerateSpringRequestsAction : AnAction() {
         val processor = CommandProcessor.getInstance()
         ApplicationManager.getApplication().runWriteAction {
             processor.executeCommand(event.project, {
-                processRequestBody(event, document, request, params)
-                processRequestParam(event, document, request, params)
+
             }, "io.github.cdgeass.GenerateSpringRequests", document)
         }
 
@@ -111,8 +110,8 @@ class GenerateSpringRequestsAction : AnAction() {
     @Suppress("UnstableApiUsage")
     private fun searchEndpoint(request: HttpRequest): PsiMethod? {
         // 获取请求路径
-        val path = request.requestTarget?.pathAbsolute?.getHttpPath(HttpRequestVariableSubstitutor.empty())
-                ?: return null
+        val path =
+            request.requestTarget?.pathAbsolute?.getHttpPath(HttpRequestVariableSubstitutor.empty()) ?: return null
 
         // 获取 endpoint
         val urlResolverManager = UrlResolverManager.getInstance(request.project)
@@ -132,14 +131,11 @@ class GenerateSpringRequestsAction : AnAction() {
      * - 标注了 @RequestBody 的参数
      */
     private fun getRequestParams(method: PsiMethod): List<Pair<AnnotationType, PsiParameter>> {
-        return method.parameterList.parameters
-            .filter { isSpringAnnotationParam(it) }
-            .mapNotNull {
-                val annotationType = it.annotations
-                    .first { annotation -> isSpringAnnotation(annotation.qualifiedName) }
-                    .let { annotation -> AnnotationType.valueOf(annotation.qualifiedName) } ?: return@mapNotNull null
-                Pair(annotationType, it)
-            }
+        return method.parameterList.parameters.filter { isSpringAnnotationParam(it) }.mapNotNull {
+            val annotationType = it.annotations.first { annotation -> isSpringAnnotation(annotation.qualifiedName) }
+                .let { annotation -> AnnotationType.valueOf(annotation.qualifiedName) } ?: return@mapNotNull null
+            Pair(annotationType, it)
+        }
     }
 
     /**
@@ -160,131 +156,47 @@ class GenerateSpringRequestsAction : AnAction() {
     }
 
     /**
-     * 处理 requestBody
+     * 生成匿名的 .http 文件, 取 PsiElement 进行插入
      */
-    private fun processRequestBody(
-        event: AnActionEvent,
-        document: Document,
-        request: HttpRequest,
-        params: List<Pair<AnnotationType, PsiParameter>>
-    ) {
-        val paramPair = params.firstOrNull { it.first == RequestBody } ?: return
-        val param = paramPair.second
+    private fun createDummyFile(params: List<Pair<AnnotationType, PsiParameter>>): HttpRequestPsiFile {
+        val headerFields = mutableListOf<String>()
 
-        var jsonStr = "{\n}"
-        val type = param.type
-        if (type is PsiClassType) {
-            type.resolve()?.apply {
-                val fields = this.allFields
-                jsonStr = "{\n"
-                fields.forEachIndexed { i, field ->
-                    jsonStr += "\t\"${field.name}\": ${if (i == fields.size - 1) "" else ","}\n"
-                }
-                jsonStr += "}"
-            }
-        }
+        var requestBody = ""
+        params.forEach { p ->
+            val annotationType = p.first
+            val param = p.second
 
-        computeHeader(event, document, request, HttpRequestHeaderFields.CONTENT_TYPE, "application/json")
-        insertRequestMessage(event, document, null, jsonStr)
-    }
-
-    private fun processRequestParam(
-        event: AnActionEvent,
-        document: Document,
-        request: HttpRequest,
-        params: List<Pair<AnnotationType, PsiParameter>>
-    ) {
-        val multipartParamPair = params.firstOrNull {
-            val type = it.second.type
-            if (type is PsiClassType) {
-                val clazz = type.resolve()
-                if (clazz != null) {
-                    if (clazz.name == "MultipartFile" && it.first == RequestParam) {
-                        return@firstOrNull true
+            if (annotationType == RequestParam) {
+                if (param.type is PsiClassType) {
+                    if ((param.type as PsiClassType).resolve()?.name == "MultipartFile") {
+                        headerFields.add("${HttpRequestHeaderFields.CONTENT_TYPE}: multipart/form-data; boundary=boundary")
                     }
                 }
             }
-            false
-        }
+            if (annotationType == RequestBody) {
+                val headerField = "${HttpRequestHeaderFields.CONTENT_TYPE}: application/json"
+                if (!headerFields.contains(headerField)) {
+                    headerFields.add(headerField)
+                }
 
-        // 拼装 param
-        val paramString = params.filter { it != multipartParamPair && it.first == RequestParam }
-            .joinToString(prefix = "?", separator = "&") {
-                val param = it.second
-                val paramName =
-                    param.annotations.firstOrNull { annotation -> annotation.qualifiedName == it.first.qualifiedName }
-                        ?.findAttributeValue("value")?.text?.removePrefix("\"")?.removeSuffix("\"")
-                "${paramName ?: param.name}="
-            }
-        insertRequestMessage(event, document, request.requestTarget!!.endOffset, paramString)
-
-        // 插入 form
-        if (multipartParamPair != null) {
-            computeHeader(event, document, request, HttpRequestHeaderFields.CONTENT_TYPE, "multipart/form-data")
-
-            val multipartParam = multipartParamPair.second
-            val type = multipartParam.type
-            if (type is PsiClassType) {
-                if (type.className == "MultipartFile") {
-                    val annotation =
-                        multipartParam.annotations.first { it.qualifiedName == multipartParamPair.first.qualifiedName }
-                    val fileName =
-                        annotation.parameterList.attributes.firstOrNull { it.name == "value" }?.text ?: ""
-                    val formString = """
-                    --boundary
-                    Content-Disposition: form-data; name="$fileName"; filename=""
-                    <
-                    """.trimIndent()
-                    insertRequestMessage(event, document, null, formString)
+                if (param.type is PsiClassType) {
+                    val clazz = (param.type as PsiClassType).resolve()
+                    clazz?.apply {
+                        requestBody = "{"
+                        this.fields.forEach { field ->
+                            requestBody += "\n\t\"${field.name}\": ,"
+                        }
+                        requestBody += "\n}"
+                    }
                 }
             }
         }
+
+        val dummyText = """
+            ###
+            POST http://0.0.0.0
+            
+        """.trimIndent()
     }
 
-    /**
-     * 判断 header 是否存在, 不存在则插入
-     */
-    private fun computeHeader(
-        event: AnActionEvent,
-        document: Document,
-        request: HttpRequest,
-        headerFieldName: String,
-        headerFieldValue: String
-    ) {
-        val headerFieldList = request.headerFieldList
-        headerFieldList.forEach {
-            if (it.name == headerFieldName && it.headerFieldValue?.text?.contains(
-                    headerFieldValue,
-                    true
-                ) == true
-            ) {
-                return
-            }
-        }
-
-        if (headerFieldList.isNotEmpty()) {
-            insertRequestMessage(
-                event,
-                document,
-                headerFieldList[headerFieldList.size - 1].endOffset,
-                "$headerFieldName: $headerFieldValue"
-            )
-        } else {
-            // TODO 插入位置
-            insertRequestMessage(event, document, request.requestTarget!!.endOffset, "\n$headerFieldName: $headerFieldValue")
-        }
-    }
-
-    /**
-     * 生成 .http 文件中插入请求体
-     */
-    private fun insertRequestMessage(
-        event: AnActionEvent,
-        document: Document,
-        offset: Int?,
-        str: String
-    ) {
-        val editor = event.getData(CommonDataKeys.EDITOR)!!
-        document.insertString(offset ?: editor.caretModel.offset, str)
-    }
 }
